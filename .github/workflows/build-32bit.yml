@@ -1,0 +1,86 @@
+name: Build Docker Image
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: 0 0 * * *
+
+jobs:
+  alpine:
+    name: Alpine
+    runs-on: ubuntu-latest
+    if: github.event.repository.owner.id == github.event.sender.id || ! github.event.sender.id
+    permissions:
+      packages: write
+      contents: write
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@master
+      - name: Check tdlib updated
+        run: |
+          commit=$(curl -L -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/tdlib/td/commits?per_page=1&path=CMakeLists.txt")
+          currentTimestamp=$(date +%s)
+          commitTimestamp=$(date -d $(echo $commit|jq .[0].commit.committer.date|tr -d '"') +%s)
+          difference=$((currentTimestamp - commitTimestamp))
+          if [ $difference -lt 90000 ];then
+            commitMessage=$(echo $commit|jq .[0].commit.message)
+            commitId=$(echo $commit|jq .[0].sha)
+            version=$(echo $commitMessage|grep -ioE "Version (to)? [0-9\.]+"|grep -oE "[0-9\.]+[0-9]+")
+            echo commitId=$commitId >> $GITHUB_ENV
+            echo version=$version >> $GITHUB_ENV
+            echo $version > current_version_32bit
+            git config --global user.email "tofuliang@gmail.com"
+            git config --global user.name "tofuliang"
+            git add current_version_32bit
+            git commit -m "update tdlib_32bit to ${version}"
+            git push
+          else
+            echo version='' >> $GITHUB_ENV
+          fi
+
+      - name: Docker meta
+        if: env.version != ''
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          flavor: |
+            latest=auto
+            prefix=
+            suffix=
+          images: |
+            tofuliang/tdlib
+            ghcr.io/tofuliang/tdlib
+          tags: |
+            type=raw,value=${{ env.version }}-32bit-alpine
+            type=raw,value=32bit-latest
+      - name: Set up QEMU
+        if: env.version != ''
+        uses: docker/setup-qemu-action@v2
+      - name: Set up Docker Buildx
+        if: env.version != ''
+        uses: docker/setup-buildx-action@v2
+      - name: Log in to Docker Hub
+        if: env.version != ''
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Log in to GHCR
+        if: env.version != ''
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build container image
+        if: env.version != ''
+        uses: docker/build-push-action@v5
+        with:
+          context: alpine
+          build-args: |
+            TD_COMMIT: ${{ env.commitId }}
+          platforms: linux/386,linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
