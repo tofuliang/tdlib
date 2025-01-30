@@ -1,13 +1,17 @@
-name: Build Docker Image
+name: Build 64bit Docker Image
 on:
   workflow_dispatch:
+    inputs:
+      commit:
+        default: ''
+        description: 'tdlib commit'
   schedule:
     - cron: 0 0 * * *
 
 jobs:
   alpine:
     name: Alpine
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id || ! github.event.sender.id
     permissions:
       packages: write
@@ -21,7 +25,7 @@ jobs:
           currentTimestamp=$(date +%s)
           commitTimestamp=$(date -d $(echo $commit|jq .[0].commit.committer.date|tr -d '"') +%s)
           difference=$((currentTimestamp - commitTimestamp))
-          if [ $difference -lt 90000 ];then
+          if [ $difference -lt 90000 ] ;then
             commitMessage=$(echo $commit|jq .[0].commit.message)
             commitId=$(echo $commit|jq .[0].sha)
             version=$(echo $commitMessage|grep -ioE "Version (to)? [0-9\.]+"|grep -oE "[0-9\.]+[0-9]+")
@@ -33,6 +37,9 @@ jobs:
             git add current_version
             git commit -m "update tdlib to ${version}"
             git push
+          elif [ "${{ github.event.inputs.commit }}" != "" ];then
+             echo commitId="${{ github.event.inputs.commit }}" >> $GITHUB_ENV
+             echo version="${{ github.event.inputs.commit }}" >> $GITHUB_ENV
           else
             echo version='' >> $GITHUB_ENV
           fi
@@ -51,13 +58,16 @@ jobs:
             ghcr.io/tofuliang/tdlib
           tags: |
             type=raw,value=${{ env.version }}-alpine
+            type=raw,value=${{ env.commitId }}-alpine
             type=raw,value=latest
-      - name: Set up QEMU
-        if: env.version != ''
-        uses: docker/setup-qemu-action@v2
+      # - name: Set up QEMU
+      #   if: env.version != ''
+      #   uses: docker/setup-qemu-action@v2
       - name: Set up Docker Buildx
         if: env.version != ''
         uses: docker/setup-buildx-action@v2
+        with:
+          platforms: linux/amd64,linux/arm64
       - name: Log in to Docker Hub
         if: env.version != ''
         uses: docker/login-action@v2
@@ -73,11 +83,33 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build container image
         if: env.version != ''
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: alpine
           build-args: |
-            TD_COMMIT: ${{ env.commitId }}
+            TD_COMMIT=${{ env.commitId }}
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}-amd64-cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build container image
+        if: env.version != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: alpine
+          build-args: |
+            TD_COMMIT=${{ env.commitId }}
+          platforms: linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}-arm64-cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build container image
+        if: env.version != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: alpine
+          build-args: |
+            TD_COMMIT=${{ env.commitId }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

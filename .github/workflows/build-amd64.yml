@@ -1,4 +1,4 @@
-name: Build 32bit Docker Image
+name: Build amd64 Docker Image
 on:
   workflow_dispatch:
     inputs:
@@ -31,11 +31,11 @@ jobs:
             version=$(echo $commitMessage|grep -ioE "Version (to)? [0-9\.]+"|grep -oE "[0-9\.]+[0-9]+")
             echo commitId=$commitId >> $GITHUB_ENV
             echo version=$version >> $GITHUB_ENV
-            echo $version > current_version_32bit
+            echo $version > current_version
             git config --global user.email "tofuliang@gmail.com"
             git config --global user.name "tofuliang"
-            git add current_version_32bit
-            git commit -m "update tdlib_32bit to ${version}"
+            git add current_version
+            git commit -m "update tdlib to ${version}"
             git push
           elif [ "${{ github.event.inputs.commit }}" != "" ];then
              echo commitId="${{ github.event.inputs.commit }}" >> $GITHUB_ENV
@@ -57,9 +57,9 @@ jobs:
             tofuliang/tdlib
             ghcr.io/tofuliang/tdlib
           tags: |
-            type=raw,value=${{ env.version }}-32bit-alpine
+            type=raw,value=${{ env.version }}-alpine
             type=raw,value=${{ env.commitId }}-alpine
-            type=raw,value=32bit-latest
+            type=raw,value=latest
       - name: Set up QEMU
         if: env.version != ''
         uses: docker/setup-qemu-action@v2
@@ -86,7 +86,7 @@ jobs:
           context: alpine
           build-args: |
             TD_COMMIT=${{ env.commitId }}
-          platforms: linux/386,linux/arm/v7
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

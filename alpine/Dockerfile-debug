@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-ARG TD_COMMIT=22d49d5
+ARG TD_COMMIT="22d49d5"
 
 ENV LANG en_US.UTF-8
 ENV TZ UTC
@@ -26,7 +26,7 @@ RUN apk update && \
     mkdir ./build && \
     cd ./build && \
     cmake \
-        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_TYPE=Debug \
         -DCMAKE_INSTALL_PREFIX:PATH=/usr/local \
         .. && \
     cmake --build . -j`grep -c ^processor /proc/cpuinfo` --target prepare_cross_compiling && \
