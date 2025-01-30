@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-ARG TD_COMMIT=24893faf7
+ARG TD_COMMIT=28c6f2e
 
 ENV LANG en_US.UTF-8
 ENV TZ UTC
