@@ -5,6 +5,9 @@ on:
       commit:
         default: ''
         description: 'tdlib commit'
+  workflow_run:
+    workflows: ["Build 64bit Docker Image"]
+    types: [completed]
   schedule:
     - cron: 0 0 * * *
 
@@ -12,7 +15,9 @@ jobs:
   alpine:
     name: Alpine
     runs-on: ubuntu-latest
-    if: github.event.repository.owner.id == github.event.sender.id || ! github.event.sender.id
+    if: >-
+      github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+      || github.event_name != 'workflow_run' && (github.event.repository.owner.id == github.event.sender.id || ! github.event.sender.id)
     permissions:
       packages: write
       contents: write
