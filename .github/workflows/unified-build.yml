@@ -1,0 +1,1155 @@
+name: Unified Docker Image Build
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        default: ''
+        description: tdlib commit
+      resume_round:
+        default: '0'
+        description: handoff round
+      resume_targets:
+        default: all
+        description: comma-separated target families to resume
+      resume_state_ref:
+        default: ''
+        description: artifact reference for previous state
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  prepare:
+    name: Prepare unified build metadata
+    runs-on: ubuntu-22.04
+    outputs:
+      commit_id: ${{ steps.prepare.outputs.commit_id }}
+      version: ${{ steps.prepare.outputs.version }}
+      resume_round: ${{ steps.prepare.outputs.resume_round }}
+      resume_targets: ${{ steps.prepare.outputs.resume_targets }}
+      resume_state_ref: ${{ steps.prepare.outputs.resume_state_ref }}
+    steps:
+      - uses: actions/checkout@master
+      - id: prepare
+        run: |
+          commit=$(curl -L -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/tdlib/td/commits?per_page=1&path=CMakeLists.txt")
+          commitMessage=$(echo "$commit" | jq -r '.[0].commit.message')
+          latestCommitId=$(echo "$commit" | jq -r '.[0].sha')
+          version=$(echo "$commitMessage" | grep -ioE "Version (to)? [0-9\.]+" | grep -oE "[0-9\.]+[0-9]+")
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.commit }}" ]; then
+            commitId="${{ github.event.inputs.commit }}"
+          else
+            commitId="$latestCommitId"
+          fi
+
+          if [ -z "$version" ]; then
+            version="$commitId"
+          fi
+
+          echo "commit_id=$commitId" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resume_round=${{ github.event.inputs.resume_round || '0' }}" >> "$GITHUB_OUTPUT"
+          echo "resume_targets=${{ github.event.inputs.resume_targets || 'all' }}" >> "$GITHUB_OUTPUT"
+          echo "resume_state_ref=${{ github.event.inputs.resume_state_ref }}" >> "$GITHUB_OUTPUT"
+
+  build-release-64:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-64') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@master
+      - name: Restore prior family state
+        if: ${{ needs.prepare.outputs.resume_round != '0' && needs.prepare.outputs.resume_state_ref != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unified-ci-state-build-release-64
+          run-id: ${{ needs.prepare.outputs.resume_state_ref }}
+          path: restored-state
+          merge-multiple: true
+      - name: Prepare release 64-bit build tooling
+        uses: docker/setup-qemu-action@v3
+      - name: Prepare release 64-bit builder
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build release 64-bit family
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
+          RESUME_ROUND: ${{ needs.prepare.outputs.resume_round }}
+          RESUME_STATE_REF: ${{ needs.prepare.outputs.resume_state_ref }}
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p state
+          state_file="state/release_64.json"
+
+          status="running"
+          last_completed_stage="release-64-source"
+          if [[ "${RUN_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+            RUN_STARTED_EPOCH="$RUN_STARTED_AT"
+          else
+            RUN_STARTED_EPOCH=$(date -d "${RUN_STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" +%s)
+          fi
+          remaining_stages='["release-64-amd64", "release-64-arm64"]'
+          needs_handoff=false
+          failure_reason=""
+          declare -a family_tags=()
+
+          write_state() {
+            local state_value="$1"
+            local last_stage="$2"
+            local remaining="$3"
+            local handoff_needed="$4"
+            local tags_json
+            tags_json="$(printf '%s\n' "${family_tags[@]}" | jq -R -s -c 'split("\n")[:-1]')"
+            jq -n \
+              --arg status "$state_value" \
+              --arg last_completed_stage "$last_stage" \
+              --argjson remaining_stages "$remaining" \
+              --arg failure_reason "$failure_reason" \
+              --argjson needs_handoff "$handoff_needed" \
+              --argjson tags "$tags_json" \
+              '{
+                enabled: true,
+                status: $status,
+                last_completed_stage: $last_completed_stage,
+                remaining_stages: $remaining_stages,
+                needs_handoff: $needs_handoff,
+                failure_reason: $failure_reason,
+                artifacts: {tags: $tags}
+              }' > "$state_file"
+          }
+
+          append_tag() {
+            family_tags+=("$1")
+          }
+
+          check_timed_handoff() {
+            local last_stage="$1"
+            local next_remaining="$2"
+            local now
+            local elapsed
+            local remaining_seconds
+
+            now=$(date +%s)
+            elapsed=$((now - RUN_STARTED_EPOCH))
+            remaining_seconds=$((6 * 60 * 60 - elapsed))
+
+            if [ "$remaining_seconds" -lt $((20 * 60)) ]; then
+              status="handoff"
+              needs_handoff=true
+              write_state "$status" "$last_stage" "$next_remaining" "$needs_handoff"
+              exit 0
+            fi
+          }
+
+          if [ "$RESUME_ROUND" != "0" ] && [ -n "$RESUME_STATE_REF" ]; then
+            if [ -f restored-state/state/release_64.json ]; then
+              cp restored-state/state/release_64.json "$state_file"
+            elif [ -f restored-state/release_64.json ]; then
+              cp restored-state/release_64.json "$state_file"
+            fi
+          fi
+
+          if [ -f "$state_file" ]; then
+            status=$(jq -r '.status // "running"' "$state_file")
+            if [ "$status" = "done" ]; then
+              exit 0
+            fi
+            if [ "$status" = "failed" ]; then
+              exit 1
+            fi
+            last_completed_stage=$(jq -r '.last_completed_stage // "release-64-source"' "$state_file")
+            remaining_stages=$(jq -c '.remaining_stages // ["release-64-amd64", "release-64-arm64"]' "$state_file")
+            mapfile -t family_tags < <(jq -r '.artifacts.tags[]?' "$state_file")
+          fi
+
+          if [ "${status}" = "running" ]; then
+            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+
+            check_timed_handoff "release-64-source" '["release-64-amd64", "release-64-arm64"]'
+
+            if docker buildx build \
+              --platform linux/amd64 \
+              --file ./alpine/Dockerfile \
+              --build-arg TD_COMMIT="$COMMIT_ID" \
+              --push \
+              --cache-from type=gha,scope=build-release-64-amd64 \
+              --cache-to type=gha,mode=max,scope=build-release-64-amd64 \
+              --tag "tofuliang/tdlib:${VERSION}-alpine-amd64" \
+              --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-amd64" \
+              --tag "tofuliang/tdlib:latest-amd64" \
+              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-amd64" \
+              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-amd64" \
+              --tag "ghcr.io/tofuliang/tdlib:latest-amd64" \
+              ./alpine; then
+              append_tag "tofuliang/tdlib:${VERSION}-alpine-amd64"
+              append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-amd64"
+              append_tag "tofuliang/tdlib:latest-amd64"
+              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-amd64"
+              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-amd64"
+              append_tag "ghcr.io/tofuliang/tdlib:latest-amd64"
+            else
+              status="failed"
+              failure_reason="release-64-amd64 build failure"
+              write_state "$status" "release-64-amd64" '["release-64-arm64"]' false
+              exit 1
+            fi
+            remaining_stages='["release-64-arm64"]'
+            last_completed_stage="release-64-amd64"
+            status="running"
+            needs_handoff=false
+            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+
+            check_timed_handoff "release-64-amd64" '["release-64-arm64"]'
+
+            if docker buildx build \
+              --platform linux/arm64 \
+              --file ./alpine/Dockerfile \
+              --build-arg TD_COMMIT="$COMMIT_ID" \
+              --push \
+              --cache-from type=gha,scope=build-release-64-arm64 \
+              --cache-to type=gha,mode=max,scope=build-release-64-arm64 \
+              --tag "tofuliang/tdlib:${VERSION}-alpine-arm64" \
+              --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-arm64" \
+              --tag "tofuliang/tdlib:latest-arm64" \
+              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-arm64" \
+              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-arm64" \
+              --tag "ghcr.io/tofuliang/tdlib:latest-arm64" \
+              ./alpine; then
+              append_tag "tofuliang/tdlib:${VERSION}-alpine-arm64"
+              append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-arm64"
+              append_tag "tofuliang/tdlib:latest-arm64"
+              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-arm64"
+              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-arm64"
+              append_tag "ghcr.io/tofuliang/tdlib:latest-arm64"
+              status="done"
+              last_completed_stage="release-64-done"
+              remaining_stages='[]'
+              needs_handoff=false
+              failure_reason=""
+              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+            else
+              status="failed"
+              failure_reason="release-64-arm64 build failure"
+              write_state "$status" "release-64-arm64" '[]' false
+              exit 1
+            fi
+          fi
+      - name: Upload family state
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-ci-state-build-release-64
+          path: state/
+
+  build-release-32:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-32') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@master
+      - name: Restore prior family state
+        if: ${{ needs.prepare.outputs.resume_round != '0' && needs.prepare.outputs.resume_state_ref != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unified-ci-state-build-release-32
+          run-id: ${{ needs.prepare.outputs.resume_state_ref }}
+          path: restored-state
+          merge-multiple: true
+      - name: Prepare release 32-bit build tooling
+        uses: docker/setup-qemu-action@v3
+      - name: Prepare release 32-bit builder
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/386,linux/arm/v7
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build release 32-bit family
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
+          RESUME_ROUND: ${{ needs.prepare.outputs.resume_round }}
+          RESUME_STATE_REF: ${{ needs.prepare.outputs.resume_state_ref }}
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p state
+          state_file="state/release_32.json"
+
+          status="running"
+          last_completed_stage="release-32-source"
+          if [[ "${RUN_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+            RUN_STARTED_EPOCH="$RUN_STARTED_AT"
+          else
+            RUN_STARTED_EPOCH=$(date -d "${RUN_STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" +%s)
+          fi
+          remaining_stages='["release-32-386", "release-32-armv7"]'
+          needs_handoff=false
+          failure_reason=""
+          declare -a family_tags=()
+
+          write_state() {
+            local state_value="$1"
+            local last_stage="$2"
+            local remaining="$3"
+            local handoff_needed="$4"
+            local tags_json
+            tags_json="$(printf '%s\n' "${family_tags[@]}" | jq -R -s -c 'split("\n")[:-1]')"
+            jq -n \
+              --arg status "$state_value" \
+              --arg last_completed_stage "$last_stage" \
+              --argjson remaining_stages "$remaining" \
+              --arg failure_reason "$failure_reason" \
+              --argjson needs_handoff "$handoff_needed" \
+              --argjson tags "$tags_json" \
+              '{
+                enabled: true,
+                status: $status,
+                last_completed_stage: $last_completed_stage,
+                remaining_stages: $remaining_stages,
+                needs_handoff: $needs_handoff,
+                failure_reason: $failure_reason,
+                artifacts: {tags: $tags}
+              }' > "$state_file"
+          }
+
+          append_tag() {
+            family_tags+=("$1")
+          }
+
+          check_timed_handoff() {
+            local last_stage="$1"
+            local next_remaining="$2"
+            local now
+            local elapsed
+            local remaining_seconds
+
+            now=$(date +%s)
+            elapsed=$((now - RUN_STARTED_EPOCH))
+            remaining_seconds=$((6 * 60 * 60 - elapsed))
+
+            if [ "$remaining_seconds" -lt $((20 * 60)) ]; then
+              status="handoff"
+              needs_handoff=true
+              write_state "$status" "$last_stage" "$next_remaining" "$needs_handoff"
+              exit 0
+            fi
+          }
+
+          if [ "$RESUME_ROUND" != "0" ] && [ -n "$RESUME_STATE_REF" ]; then
+            if [ -f restored-state/state/release_32.json ]; then
+              cp restored-state/state/release_32.json "$state_file"
+            elif [ -f restored-state/release_32.json ]; then
+              cp restored-state/release_32.json "$state_file"
+            fi
+          fi
+
+          if [ -f "$state_file" ]; then
+            status=$(jq -r '.status // "running"' "$state_file")
+            if [ "$status" = "done" ]; then
+              exit 0
+            fi
+            if [ "$status" = "failed" ]; then
+              exit 1
+            fi
+            last_completed_stage=$(jq -r '.last_completed_stage // "release-32-source"' "$state_file")
+            remaining_stages=$(jq -c '.remaining_stages // ["release-32-386", "release-32-armv7"]' "$state_file")
+            mapfile -t family_tags < <(jq -r '.artifacts.tags[]?' "$state_file")
+          fi
+
+          if [ "${status}" = "running" ]; then
+            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+
+            check_timed_handoff "release-32-source" '["release-32-386", "release-32-armv7"]'
+
+            if docker buildx build \
+              --platform linux/386 \
+              --file ./alpine/Dockerfile \
+              --build-arg TD_COMMIT="$COMMIT_ID" \
+              --push \
+              --cache-from type=gha,scope=build-release-32-386 \
+              --cache-to type=gha,mode=max,scope=build-release-32-386 \
+              --tag "tofuliang/tdlib:${VERSION}-alpine-386" \
+              --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-386" \
+              --tag "tofuliang/tdlib:32bit-latest" \
+              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-386" \
+              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-386" \
+              --tag "ghcr.io/tofuliang/tdlib:32bit-latest" \
+              ./alpine; then
+              append_tag "tofuliang/tdlib:${VERSION}-alpine-386"
+              append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-386"
+              append_tag "tofuliang/tdlib:32bit-latest"
+              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-386"
+              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-386"
+              append_tag "ghcr.io/tofuliang/tdlib:32bit-latest"
+            else
+              status="failed"
+              failure_reason="release-32-386 build failure"
+              write_state "$status" "release-32-386" '["release-32-armv7"]' false
+              exit 1
+            fi
+            remaining_stages='["release-32-armv7"]'
+            last_completed_stage="release-32-386"
+            status="running"
+            needs_handoff=false
+            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+
+            check_timed_handoff "release-32-386" '["release-32-armv7"]'
+
+            if docker buildx build \
+              --platform linux/arm/v7 \
+              --file ./alpine/Dockerfile \
+              --build-arg TD_COMMIT="$COMMIT_ID" \
+              --push \
+              --cache-from type=gha,scope=build-release-32-armv7 \
+              --cache-to type=gha,mode=max,scope=build-release-32-armv7 \
+              --tag "tofuliang/tdlib:${VERSION}-alpine-armv7" \
+              --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-armv7" \
+              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-armv7" \
+              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-armv7" \
+              ./alpine; then
+              append_tag "tofuliang/tdlib:${VERSION}-alpine-armv7"
+              append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-armv7"
+              append_tag "tofuliang/tdlib:32bit-latest"
+              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-armv7"
+              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-armv7"
+              append_tag "ghcr.io/tofuliang/tdlib:32bit-latest"
+              status="done"
+              last_completed_stage="release-32-done"
+              remaining_stages='[]'
+              needs_handoff=false
+              failure_reason=""
+              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+            else
+              status="failed"
+              failure_reason="release-32-armv7 build failure"
+              write_state "$status" "release-32-armv7" '[]' false
+              exit 1
+            fi
+          fi
+      - name: Upload family state
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-ci-state-build-release-32
+          path: state/
+
+  build-debug-64:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-64') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@master
+      - name: Restore prior family state
+        if: ${{ needs.prepare.outputs.resume_round != '0' && needs.prepare.outputs.resume_state_ref != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unified-ci-state-build-debug-64
+          run-id: ${{ needs.prepare.outputs.resume_state_ref }}
+          path: restored-state
+          merge-multiple: true
+      - name: Prepare debug 64-bit build tooling
+        uses: docker/setup-qemu-action@v3
+      - name: Prepare debug 64-bit builder
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build debug 64-bit family
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
+          RESUME_ROUND: ${{ needs.prepare.outputs.resume_round }}
+          RESUME_STATE_REF: ${{ needs.prepare.outputs.resume_state_ref }}
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p state
+          state_file="state/debug_64.json"
+
+          status="running"
+          last_completed_stage="debug-64-source"
+          if [[ "${RUN_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+            RUN_STARTED_EPOCH="$RUN_STARTED_AT"
+          else
+            RUN_STARTED_EPOCH=$(date -d "${RUN_STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" +%s)
+          fi
+          remaining_stages='["debug-64-amd64", "debug-64-arm64"]'
+          needs_handoff=false
+          failure_reason=""
+          declare -a family_tags=()
+
+          write_state() {
+            local state_value="$1"
+            local last_stage="$2"
+            local remaining="$3"
+            local handoff_needed="$4"
+            local tags_json
+            tags_json="$(printf '%s\n' "${family_tags[@]}" | jq -R -s -c 'split("\n")[:-1]')"
+            jq -n \
+              --arg status "$state_value" \
+              --arg last_completed_stage "$last_stage" \
+              --argjson remaining_stages "$remaining" \
+              --arg failure_reason "$failure_reason" \
+              --argjson needs_handoff "$handoff_needed" \
+              --argjson tags "$tags_json" \
+              '{
+                enabled: true,
+                status: $status,
+                last_completed_stage: $last_completed_stage,
+                remaining_stages: $remaining_stages,
+                needs_handoff: $needs_handoff,
+                failure_reason: $failure_reason,
+                artifacts: {tags: $tags}
+              }' > "$state_file"
+          }
+
+          append_tag() {
+            family_tags+=("$1")
+          }
+
+          check_timed_handoff() {
+            local last_stage="$1"
+            local next_remaining="$2"
+            local now
+            local elapsed
+            local remaining_seconds
+
+            now=$(date +%s)
+            elapsed=$((now - RUN_STARTED_EPOCH))
+            remaining_seconds=$((6 * 60 * 60 - elapsed))
+
+            if [ "$remaining_seconds" -lt $((20 * 60)) ]; then
+              status="handoff"
+              needs_handoff=true
+              write_state "$status" "$last_stage" "$next_remaining" "$needs_handoff"
+              exit 0
+            fi
+          }
+
+          if [ "$RESUME_ROUND" != "0" ] && [ -n "$RESUME_STATE_REF" ]; then
+            if [ -f restored-state/state/debug_64.json ]; then
+              cp restored-state/state/debug_64.json "$state_file"
+            elif [ -f restored-state/debug_64.json ]; then
+              cp restored-state/debug_64.json "$state_file"
+            fi
+          fi
+
+          if [ -f "$state_file" ]; then
+            status=$(jq -r '.status // "running"' "$state_file")
+            if [ "$status" = "done" ]; then
+              exit 0
+            fi
+            if [ "$status" = "failed" ]; then
+              exit 1
+            fi
+            last_completed_stage=$(jq -r '.last_completed_stage // "debug-64-source"' "$state_file")
+            remaining_stages=$(jq -c '.remaining_stages // ["debug-64-amd64", "debug-64-arm64"]' "$state_file")
+            mapfile -t family_tags < <(jq -r '.artifacts.tags[]?' "$state_file")
+          fi
+
+          if [ "${status}" = "running" ]; then
+            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+
+            check_timed_handoff "debug-64-source" '["debug-64-amd64", "debug-64-arm64"]'
+
+            if docker buildx build \
+              --platform linux/amd64 \
+              --file ./alpine/Dockerfile-debug \
+              --build-arg TD_COMMIT="$COMMIT_ID" \
+              --push \
+              --cache-from type=gha,scope=build-debug-64-amd64 \
+              --cache-to type=gha,mode=max,scope=build-debug-64-amd64 \
+              --tag "tofuliang/tdlib:${VERSION}-debug-alpine-amd64" \
+              --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64" \
+              --tag "tofuliang/tdlib:latest-debug-amd64" \
+              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64" \
+              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64" \
+              --tag "ghcr.io/tofuliang/tdlib:latest-debug-amd64" \
+              ./alpine; then
+              append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-amd64"
+              append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64"
+              append_tag "tofuliang/tdlib:latest-debug-amd64"
+              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64"
+              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64"
+              append_tag "ghcr.io/tofuliang/tdlib:latest-debug-amd64"
+            else
+              status="failed"
+              failure_reason="debug-64-amd64 build failure"
+              write_state "$status" "debug-64-amd64" '["debug-64-arm64"]' false
+              exit 1
+            fi
+            remaining_stages='["debug-64-arm64"]'
+            last_completed_stage="debug-64-amd64"
+            status="running"
+            needs_handoff=false
+            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+
+            check_timed_handoff "debug-64-amd64" '["debug-64-arm64"]'
+
+            if docker buildx build \
+              --platform linux/arm64 \
+              --file ./alpine/Dockerfile-debug \
+              --build-arg TD_COMMIT="$COMMIT_ID" \
+              --push \
+              --cache-from type=gha,scope=build-debug-64-arm64 \
+              --cache-to type=gha,mode=max,scope=build-debug-64-arm64 \
+              --tag "tofuliang/tdlib:${VERSION}-debug-alpine-arm64" \
+              --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64" \
+              --tag "tofuliang/tdlib:latest-debug-arm64" \
+              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64" \
+              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64" \
+              --tag "ghcr.io/tofuliang/tdlib:latest-debug-arm64" \
+              ./alpine; then
+              append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-arm64"
+              append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64"
+              append_tag "tofuliang/tdlib:latest-debug-arm64"
+              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64"
+              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64"
+              append_tag "ghcr.io/tofuliang/tdlib:latest-debug-arm64"
+              status="done"
+              last_completed_stage="debug-64-done"
+              remaining_stages='[]'
+              needs_handoff=false
+              failure_reason=""
+              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+            else
+              status="failed"
+              failure_reason="debug-64-arm64 build failure"
+              write_state "$status" "debug-64-arm64" '[]' false
+              exit 1
+            fi
+          fi
+      - name: Upload family state
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-ci-state-build-debug-64
+          path: state/
+
+  build-debug-32:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-32') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@master
+      - name: Restore prior family state
+        if: ${{ needs.prepare.outputs.resume_round != '0' && needs.prepare.outputs.resume_state_ref != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unified-ci-state-build-debug-32
+          run-id: ${{ needs.prepare.outputs.resume_state_ref }}
+          path: restored-state
+          merge-multiple: true
+      - name: Prepare debug 32-bit build tooling
+        uses: docker/setup-qemu-action@v3
+      - name: Prepare debug 32-bit builder
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/386,linux/arm/v7
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build debug 32-bit family
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
+          RESUME_ROUND: ${{ needs.prepare.outputs.resume_round }}
+          RESUME_STATE_REF: ${{ needs.prepare.outputs.resume_state_ref }}
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p state
+          state_file="state/debug_32.json"
+
+          status="running"
+          last_completed_stage="debug-32-source"
+          if [[ "${RUN_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+            RUN_STARTED_EPOCH="$RUN_STARTED_AT"
+          else
+            RUN_STARTED_EPOCH=$(date -d "${RUN_STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" +%s)
+          fi
+          remaining_stages='["debug-32-386", "debug-32-armv7"]'
+          needs_handoff=false
+          failure_reason=""
+          declare -a family_tags=()
+
+          write_state() {
+            local state_value="$1"
+            local last_stage="$2"
+            local remaining="$3"
+            local handoff_needed="$4"
+            local tags_json
+            tags_json="$(printf '%s\n' "${family_tags[@]}" | jq -R -s -c 'split("\n")[:-1]')"
+            jq -n \
+              --arg status "$state_value" \
+              --arg last_completed_stage "$last_stage" \
+              --argjson remaining_stages "$remaining" \
+              --arg failure_reason "$failure_reason" \
+              --argjson needs_handoff "$handoff_needed" \
+              --argjson tags "$tags_json" \
+              '{
+                enabled: true,
+                status: $status,
+                last_completed_stage: $last_completed_stage,
+                remaining_stages: $remaining_stages,
+                needs_handoff: $needs_handoff,
+                failure_reason: $failure_reason,
+                artifacts: {tags: $tags}
+              }' > "$state_file"
+          }
+
+          append_tag() {
+            family_tags+=("$1")
+          }
+
+          check_timed_handoff() {
+            local last_stage="$1"
+            local next_remaining="$2"
+            local now
+            local elapsed
+            local remaining_seconds
+
+            now=$(date +%s)
+            elapsed=$((now - RUN_STARTED_EPOCH))
+            remaining_seconds=$((6 * 60 * 60 - elapsed))
+
+            if [ "$remaining_seconds" -lt $((20 * 60)) ]; then
+              status="handoff"
+              needs_handoff=true
+              write_state "$status" "$last_stage" "$next_remaining" "$needs_handoff"
+              exit 0
+            fi
+          }
+
+          if [ "$RESUME_ROUND" != "0" ] && [ -n "$RESUME_STATE_REF" ]; then
+            if [ -f restored-state/state/debug_32.json ]; then
+              cp restored-state/state/debug_32.json "$state_file"
+            elif [ -f restored-state/debug_32.json ]; then
+              cp restored-state/debug_32.json "$state_file"
+            fi
+          fi
+
+          if [ -f "$state_file" ]; then
+            status=$(jq -r '.status // "running"' "$state_file")
+            if [ "$status" = "done" ]; then
+              exit 0
+            fi
+            if [ "$status" = "failed" ]; then
+              exit 1
+            fi
+            last_completed_stage=$(jq -r '.last_completed_stage // "debug-32-source"' "$state_file")
+            remaining_stages=$(jq -c '.remaining_stages // ["debug-32-386", "debug-32-armv7"]' "$state_file")
+            mapfile -t family_tags < <(jq -r '.artifacts.tags[]?' "$state_file")
+          fi
+
+          if [ "${status}" = "running" ]; then
+            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+
+            check_timed_handoff "debug-32-source" '["debug-32-386", "debug-32-armv7"]'
+
+            if docker buildx build \
+              --platform linux/386 \
+              --file ./alpine/Dockerfile-debug \
+              --build-arg TD_COMMIT="$COMMIT_ID" \
+              --push \
+              --cache-from type=gha,scope=build-debug-32-386 \
+              --cache-to type=gha,mode=max,scope=build-debug-32-386 \
+              --tag "tofuliang/tdlib:${VERSION}-debug-alpine-386" \
+              --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386" \
+              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386" \
+              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386" \
+              ./alpine; then
+              append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-386"
+              append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386"
+              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386"
+              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386"
+              status="running"
+              remaining_stages='["debug-32-armv7"]'
+              last_completed_stage="debug-32-386"
+              needs_handoff=false
+              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+            else
+              status="failed"
+              failure_reason="debug-32-386 build failure"
+              write_state "$status" "debug-32-386" '["debug-32-armv7"]' false
+              exit 1
+            fi
+
+            check_timed_handoff "debug-32-386" '["debug-32-armv7"]'
+
+            if docker buildx build \
+              --platform linux/arm/v7 \
+              --file ./alpine/Dockerfile-debug \
+              --build-arg TD_COMMIT="$COMMIT_ID" \
+              --push \
+              --cache-from type=gha,scope=build-debug-32-armv7 \
+              --cache-to type=gha,mode=max,scope=build-debug-32-armv7 \
+              --tag "tofuliang/tdlib:${VERSION}-debug-alpine-armv7" \
+              --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7" \
+              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7" \
+              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7" \
+              ./alpine; then
+              append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-armv7"
+              append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7"
+              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7"
+              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7"
+              status="done"
+              last_completed_stage="debug-32-done"
+              remaining_stages='[]'
+              needs_handoff=false
+              failure_reason=""
+              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+            else
+              status="failed"
+              failure_reason="debug-32-armv7 build failure"
+              write_state "$status" "debug-32-armv7" '[]' false
+              exit 1
+            fi
+          fi
+      - name: Upload family state
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-ci-state-build-debug-32
+          path: state/
+
+  publish:
+    needs: [prepare, build-release-64, build-release-32, build-debug-64, build-debug-32]
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Download family state
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unified-ci-state-*
+          path: downloaded-state
+          merge-multiple: true
+      - name: Gate and publish aggregate images
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
+          RESUME_ROUND: ${{ needs.prepare.outputs.resume_round }}
+          RESUME_TARGETS: ${{ needs.prepare.outputs.resume_targets }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$VERSION" ] || [ -z "$COMMIT_ID" ]; then
+            echo "version/commit not available, skipping publish"
+            exit 0
+          fi
+
+          publish_allowed=true
+
+          family_state_files=()
+          if [ "$RESUME_ROUND" = "0" ] || [ -z "$RESUME_TARGETS" ] || [ "$RESUME_TARGETS" = "all" ]; then
+            family_state_files=(release_64 release_32 debug_64 debug_32)
+          else
+            IFS=','
+            read -r -a requested_targets <<< "$RESUME_TARGETS"
+            for target in "${requested_targets[@]}"; do
+              case "$target" in
+                release-64) family_state_files+=(release_64) ;;
+                release-32) family_state_files+=(release_32) ;;
+                debug-64) family_state_files+=(debug_64) ;;
+                debug-32) family_state_files+=(debug_32) ;;
+              esac
+            done
+            unset IFS
+          fi
+
+          for family in "${family_state_files[@]}"; do
+            state_file=""
+            if [ -f "downloaded-state/state/${family}.json" ]; then
+              state_file="downloaded-state/state/${family}.json"
+            elif [ -f "downloaded-state/${family}.json" ]; then
+              state_file="downloaded-state/${family}.json"
+            else
+              publish_allowed=false
+              echo "Missing family state file for: $family"
+              continue
+            fi
+
+            status=$(jq -r '.status' "$state_file")
+            if [ "$status" != "done" ]; then
+              publish_allowed=false
+            fi
+            if [ "$status" = "handoff" ] || [ "$status" = "running" ]; then
+              publish_allowed=false
+            fi
+            if [ "$status" = "failed" ]; then
+              publish_allowed=false
+            fi
+          done
+
+          if [ "$publish_allowed" != true ]; then
+            echo "Publish gate not satisfied; all families must be done and not handoff"
+            exit 0
+          fi
+
+          docker run --rm --privileged tonistiigi/binfmt --install all
+          docker buildx create --use
+          docker buildx inspect --bootstrap
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish release and debug aggregate tags
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
+        run: |
+          docker buildx imagetools create \
+            -t tofuliang/tdlib:${VERSION}-alpine \
+            tofuliang/tdlib:${VERSION}-alpine-amd64 \
+            tofuliang/tdlib:${VERSION}-alpine-arm64 \
+            tofuliang/tdlib:${VERSION}-alpine-386 \
+            tofuliang/tdlib:${VERSION}-alpine-armv7
+          docker buildx imagetools create \
+            -t tofuliang/tdlib:${COMMIT_ID}-alpine \
+            tofuliang/tdlib:${COMMIT_ID}-alpine-amd64 \
+            tofuliang/tdlib:${COMMIT_ID}-alpine-arm64 \
+            tofuliang/tdlib:${COMMIT_ID}-alpine-386 \
+            tofuliang/tdlib:${COMMIT_ID}-alpine-armv7
+          docker buildx imagetools create \
+            -t tofuliang/tdlib:latest \
+            tofuliang/tdlib:${VERSION}-alpine-amd64 \
+            tofuliang/tdlib:${VERSION}-alpine-arm64 \
+            tofuliang/tdlib:${VERSION}-alpine-386 \
+            tofuliang/tdlib:${VERSION}-alpine-armv7
+          docker buildx imagetools create \
+            -t ghcr.io/tofuliang/tdlib:${VERSION}-alpine \
+            ghcr.io/tofuliang/tdlib:${VERSION}-alpine-amd64 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-alpine-arm64 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-alpine-386 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-alpine-armv7
+          docker buildx imagetools create \
+            -t ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-amd64 \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-arm64 \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-386 \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-armv7
+          docker buildx imagetools create \
+            -t ghcr.io/tofuliang/tdlib:latest \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-amd64 \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-arm64 \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-386 \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-armv7
+          docker buildx imagetools create \
+            -t tofuliang/tdlib:${VERSION}-debug-alpine \
+            tofuliang/tdlib:${VERSION}-debug-alpine-amd64 \
+            tofuliang/tdlib:${VERSION}-debug-alpine-arm64 \
+            tofuliang/tdlib:${VERSION}-debug-alpine-386 \
+            tofuliang/tdlib:${VERSION}-debug-alpine-armv7
+          docker buildx imagetools create \
+            -t tofuliang/tdlib:${COMMIT_ID}-debug-alpine \
+            tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64 \
+            tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64 \
+            tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386 \
+            tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7
+          docker buildx imagetools create \
+            -t tofuliang/tdlib:latest-debug \
+            tofuliang/tdlib:${VERSION}-debug-alpine-amd64 \
+            tofuliang/tdlib:${VERSION}-debug-alpine-arm64 \
+            tofuliang/tdlib:${VERSION}-debug-alpine-386 \
+            tofuliang/tdlib:${VERSION}-debug-alpine-armv7
+          docker buildx imagetools create \
+            -t ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7
+          docker buildx imagetools create \
+            -t ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64 \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64 \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386 \
+            ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7
+          docker buildx imagetools create \
+            -t ghcr.io/tofuliang/tdlib:latest-debug \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7
+
+  handoff-or-fail:
+    needs: [prepare, build-release-64, build-release-32, build-debug-64, build-debug-32, publish]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download family state
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unified-ci-state-*
+          path: downloaded-state
+          merge-multiple: true
+      - name: Decide continuation or fail
+        env:
+          RESUME_ROUND: ${{ needs.prepare.outputs.resume_round }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          RESUME_TARGETS: ${{ needs.prepare.outputs.resume_targets }}
+        run: |
+          set -euo pipefail
+
+          if [ "$PUBLISH_RESULT" = "failure" ]; then
+            echo "publish failed"
+            exit 1
+          fi
+
+          family_files=()
+          if [ "$RESUME_ROUND" = "0" ] || [ -z "$RESUME_TARGETS" ] || [ "$RESUME_TARGETS" = "all" ]; then
+            family_files=(release_64 release_32 debug_64 debug_32)
+          else
+            IFS=','
+            read -r -a requested_targets <<< "$RESUME_TARGETS"
+            for target in "${requested_targets[@]}"; do
+              case "$target" in
+                release-64) family_files+=(release_64) ;;
+                release-32) family_files+=(release_32) ;;
+                debug-64) family_files+=(debug_64) ;;
+                debug-32) family_files+=(debug_32) ;;
+              esac
+            done
+            unset IFS
+          fi
+
+          all_done=true
+          needs_handoff=false
+          incomplete_targets=()
+
+
+          for family in "${family_files[@]}"; do
+            if [ -f "downloaded-state/state/${family}.json" ]; then
+              file="downloaded-state/state/${family}.json"
+            elif [ -f "downloaded-state/${family}.json" ]; then
+              file="downloaded-state/${family}.json"
+            else
+              all_done=false
+              needs_handoff=true
+              case "$family" in
+                release_64) incomplete_targets+=("release-64") ;;
+                release_32) incomplete_targets+=("release-32") ;;
+                debug_64) incomplete_targets+=("debug-64") ;;
+                debug_32) incomplete_targets+=("debug-32") ;;
+              esac
+              continue
+            fi
+
+            status=$(jq -r '.status' "$file")
+            case "$status" in
+              done)
+                ;;
+              failed)
+                echo "Family failed: $file"
+                exit 1
+                ;;
+              handoff)
+                needs_handoff=true
+                all_done=false
+                ;;
+              *)
+                all_done=false
+                needs_handoff=true
+                ;;
+            esac
+
+            if [ "$status" = "handoff" ]; then
+              case "$file" in
+                *release_64.json) incomplete_targets+=("release-64") ;;
+                *release_32.json) incomplete_targets+=("release-32") ;;
+                *debug_64.json) incomplete_targets+=("debug-64") ;;
+                *debug_32.json) incomplete_targets+=("debug-32") ;;
+              esac
+            fi
+          done
+
+          if [ "$all_done" = true ]; then
+            echo "All families complete; skip handoff"
+            exit 0
+          fi
+
+          if [ "$needs_handoff" = true ]; then
+            if [ "$RESUME_ROUND" -lt 2 ]; then
+              # resume_round < 2
+              next_round=$((RESUME_ROUND + 1))
+              IFS=','
+              resume_targets_value="$(printf '%s,' "${incomplete_targets[@]}" | sed 's/,$//')"
+              if [ -z "${resume_targets_value}" ]; then
+                resume_targets_value="all"
+              fi
+              gh workflow run unified-build.yml \
+                --ref main \
+                --field resume_round="${next_round}" \
+                --field resume_targets="${resume_targets_value}" \
+                --field resume_state_ref="${{ github.run_id }}" \
+                --field commit="${{ needs.prepare.outputs.commit_id }}"
+              exit 0
+            else
+              echo "Handoff was required but resume_round=${RESUME_ROUND} already exhausted"
+              exit 1
+            fi
+          fi
+
+          exit 0
