@@ -8,6 +8,9 @@ on:
       version:
         default: ''
         description: tdlib version tag override
+      publish_debug_only:
+        default: 'false'
+        description: publish debug manifests from existing architecture tags
       resume_round:
         default: '0'
         description: handoff round
@@ -60,7 +63,7 @@ jobs:
 
   build-release-64:
     needs: prepare
-    if: ${{ needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-64') }}
+    if: ${{ github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-64')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -266,7 +269,7 @@ jobs:
 
   build-release-32:
     needs: prepare
-    if: ${{ needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-32') }}
+    if: ${{ github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-32')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -470,7 +473,7 @@ jobs:
 
   build-debug-64:
     needs: prepare
-    if: ${{ needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-64') }}
+    if: ${{ github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-64')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -676,7 +679,7 @@ jobs:
 
   build-debug-32:
     needs: prepare
-    if: ${{ needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-32') }}
+    if: ${{ github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-32')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -874,6 +877,7 @@ jobs:
 
   publish-debug:
     needs: [prepare, build-debug-64, build-debug-32]
+    if: ${{ always() && (github.event.inputs.publish_debug_only == 'true' || (needs.build-debug-64.result == 'success' && needs.build-debug-32.result == 'success')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -882,6 +886,7 @@ jobs:
       published: ${{ steps.debug_gate.outputs.published }}
     steps:
       - name: Download debug family state
+        if: ${{ github.event.inputs.publish_debug_only != 'true' }}
         uses: actions/download-artifact@v4
         with:
           pattern: unified-ci-state-build-debug-*
@@ -892,6 +897,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "published=false" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event.inputs.publish_debug_only }}" = "true" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           for family in debug_64 debug_32; do
             state_file=""
             if [ -f "downloaded-state/state/${family}.json" ]; then
@@ -1174,7 +1183,7 @@ jobs:
 
   handoff-or-fail:
     needs: [prepare, build-release-64, build-release-32, build-debug-64, build-debug-32, publish]
-    if: always()
+    if: ${{ always() && github.event.inputs.publish_debug_only != 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@master
