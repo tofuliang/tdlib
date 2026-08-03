@@ -27,6 +27,7 @@ RUN apk update && \
     cd ./build && \
     cmake \
         -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_INSTALL_PREFIX:PATH=/usr/local \
         .. && \
     cmake --build . -j`grep -c ^processor /proc/cpuinfo` --target prepare_cross_compiling && \
