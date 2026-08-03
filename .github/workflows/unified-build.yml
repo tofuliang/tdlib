@@ -5,6 +5,9 @@ on:
       commit:
         default: ''
         description: tdlib commit
+      version:
+        default: ''
+        description: tdlib version tag override
       resume_round:
         default: '0'
         description: handoff round
@@ -40,6 +43,9 @@ jobs:
             commitId="${{ github.event.inputs.commit }}"
           else
             commitId="$latestCommitId"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            version="${{ github.event.inputs.version }}"
           fi
 
           if [ -z "$version" ]; then
@@ -866,12 +872,90 @@ jobs:
           name: unified-ci-state-build-debug-32
           path: state/
 
+  publish-debug:
+    needs: [prepare, build-debug-64, build-debug-32]
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      published: ${{ steps.debug_gate.outputs.published }}
+    steps:
+      - name: Download debug family state
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unified-ci-state-build-debug-*
+          path: downloaded-state
+          merge-multiple: true
+      - name: Gate debug aggregate images
+        id: debug_gate
+        run: |
+          set -euo pipefail
+          echo "published=false" >> "$GITHUB_OUTPUT"
+          for family in debug_64 debug_32; do
+            state_file=""
+            if [ -f "downloaded-state/state/${family}.json" ]; then
+              state_file="downloaded-state/state/${family}.json"
+            elif [ -f "downloaded-state/${family}.json" ]; then
+              state_file="downloaded-state/${family}.json"
+            fi
+            if [ -z "$state_file" ] || [ "$(jq -r '.status' "$state_file")" != "done" ]; then
+              echo "Debug family is not complete: $family"
+              exit 0
+            fi
+          done
+          echo "published=true" >> "$GITHUB_OUTPUT"
+      - name: Prepare debug manifest builder
+        if: steps.debug_gate.outputs.published == 'true'
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub
+        if: steps.debug_gate.outputs.published == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Log in to GHCR
+        if: steps.debug_gate.outputs.published == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish debug aggregate tags
+        if: steps.debug_gate.outputs.published == 'true'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
+        run: |
+          set -euo pipefail
+          debug_sources=(
+            "tofuliang/tdlib:${VERSION}-debug-alpine-amd64"
+            "tofuliang/tdlib:${VERSION}-debug-alpine-arm64"
+            "tofuliang/tdlib:${VERSION}-debug-alpine-386"
+            "tofuliang/tdlib:${VERSION}-debug-alpine-armv7"
+          )
+          docker buildx imagetools create -t "tofuliang/tdlib:${VERSION}-debug-alpine" "${debug_sources[@]}"
+          docker buildx imagetools create -t "tofuliang/tdlib:${COMMIT_ID}-debug-alpine" "${debug_sources[@]}"
+          docker buildx imagetools create -t "tofuliang/tdlib:latest-debug" "${debug_sources[@]}"
+
+          ghcr_sources=(
+            "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64"
+            "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64"
+            "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386"
+            "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7"
+          )
+          docker buildx imagetools create -t "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine" "${ghcr_sources[@]}"
+          docker buildx imagetools create -t "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-debug" "${ghcr_sources[@]}"
+          docker buildx imagetools create -t "ghcr.io/tofuliang/tdlib:latest-debug" "${ghcr_sources[@]}"
+
   publish:
     needs: [prepare, build-release-64, build-release-32, build-debug-64, build-debug-32]
     runs-on: ubuntu-22.04
     permissions:
       packages: write
       contents: read
+    outputs:
+      published: ${{ steps.publish_gate.outputs.published }}
     steps:
       - name: Download family state
         uses: actions/download-artifact@v4
@@ -880,6 +964,7 @@ jobs:
           path: downloaded-state
           merge-multiple: true
       - name: Gate and publish aggregate images
+        id: publish_gate
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
@@ -887,6 +972,7 @@ jobs:
           RESUME_TARGETS: ${{ needs.prepare.outputs.resume_targets }}
         run: |
           set -euo pipefail
+          echo "published=false" >> "$GITHUB_OUTPUT"
 
           if [ -z "$VERSION" ] || [ -z "$COMMIT_ID" ]; then
             echo "version/commit not available, skipping publish"
@@ -944,18 +1030,22 @@ jobs:
           docker run --rm --privileged tonistiigi/binfmt --install all
           docker buildx create --use
           docker buildx inspect --bootstrap
+          echo "published=true" >> "$GITHUB_OUTPUT"
       - name: Log in to Docker Hub
+        if: steps.publish_gate.outputs.published == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
       - name: Log in to GHCR
+        if: steps.publish_gate.outputs.published == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish release and debug aggregate tags
+        if: steps.publish_gate.outputs.published == 'true'
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
@@ -1021,6 +1111,12 @@ jobs:
             ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386 \
             ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7
           docker buildx imagetools create \
+            -t ghcr.io/tofuliang/tdlib:${VERSION}-alpine-debug \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386 \
+            ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7
+          docker buildx imagetools create \
             -t ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine \
             ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64 \
             ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64 \
@@ -1033,11 +1129,55 @@ jobs:
             ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386 \
             ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7
 
+  cleanup-ghcr:
+    needs: [publish, publish-debug]
+    if: ${{ always() && ((needs.publish.result == 'success' && needs.publish.outputs.published == 'true') || (needs.publish-debug.result == 'success' && needs.publish-debug.outputs.published == 'true')) }}
+    runs-on: ubuntu-22.04
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Keep only the newest two GHCR versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          versions_json="$(gh api --paginate --slurp "/users/${PACKAGE_OWNER}/packages/container/tdlib/versions?per_page=100" | jq 'add')"
+          mapfile -t semantic_versions < <(
+            jq -r '.[].metadata.container.tags[]? | try capture("^(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)-").version catch empty' <<< "$versions_json" |
+              sort -Vu
+          )
+          if [ "${#semantic_versions[@]}" -le 2 ]; then
+            echo "GHCR already contains at most two semantic versions"
+            exit 0
+          fi
+          keep_versions_json="$(printf '%s\n' "${semantic_versions[@]}" | tail -n 2 | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+          cutoff="$(jq -r --argjson keep "$keep_versions_json" '
+            def tag_version: try capture("^(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)-").version catch "";
+            [.[] |
+              select(any(.metadata.container.tags[]?;
+                (tag_version as $version | $version != "" and ($keep | index($version) != null)))) |
+              .created_at] | min // ""
+          ' <<< "$versions_json")"
+          if [ -z "$cutoff" ]; then
+            echo "Unable to determine GHCR retention cutoff" >&2
+            exit 1
+          fi
+          echo "Keeping semantic versions: $(jq -r 'join(", ")' <<< "$keep_versions_json")"
+          echo "Deleting GHCR package versions older than: $cutoff"
+          while IFS= read -r version_id; do
+            [ -n "$version_id" ] || continue
+            echo "Deleting GHCR package version id=$version_id"
+            gh api --method DELETE "/users/${PACKAGE_OWNER}/packages/container/tdlib/versions/${version_id}"
+          done < <(jq -r --arg cutoff "$cutoff" '.[] | select(.created_at < $cutoff) | .id' <<< "$versions_json")
+
   handoff-or-fail:
     needs: [prepare, build-release-64, build-release-32, build-debug-64, build-debug-32, publish]
     if: always()
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@master
       - name: Download family state
         uses: actions/download-artifact@v4
         with:

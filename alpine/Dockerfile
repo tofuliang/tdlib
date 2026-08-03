@@ -2,8 +2,8 @@ FROM alpine:latest
 
 ARG TD_COMMIT=22d49d5
 
-ENV LANG en_US.UTF-8
-ENV TZ UTC
+ENV LANG=en_US.UTF-8
+ENV TZ=UTC
 
 RUN apk update && \
     apk upgrade && \
