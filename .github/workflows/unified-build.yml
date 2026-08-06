@@ -96,6 +96,8 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build release 64-bit family
+        timeout-minutes: 330
+        continue-on-error: true
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
@@ -184,6 +186,10 @@ jobs:
             if [ "$status" = "failed" ]; then
               exit 1
             fi
+            if [ "$status" = "handoff" ]; then
+              status="running"
+              needs_handoff=false
+            fi
             last_completed_stage=$(jq -r '.last_completed_stage // "release-64-source"' "$state_file")
             remaining_stages=$(jq -c '.remaining_stages // ["release-64-amd64", "release-64-arm64"]' "$state_file")
             mapfile -t family_tags < <(jq -r '.artifacts.tags[]?' "$state_file")
@@ -192,76 +198,81 @@ jobs:
           if [ "${status}" = "running" ]; then
             write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
 
-            check_timed_handoff "release-64-source" '["release-64-amd64", "release-64-arm64"]'
+            if jq -e --arg stage "release-64-amd64" 'index($stage) != null' <<< "$remaining_stages" > /dev/null; then
+              check_timed_handoff "$last_completed_stage" "$remaining_stages"
 
-            if docker buildx build \
-              --platform linux/amd64 \
-              --file ./alpine/Dockerfile \
-              --build-arg TD_COMMIT="$COMMIT_ID" \
-              --push \
-              --cache-from type=gha,scope=build-release-64-amd64 \
-              --cache-to type=gha,mode=max,scope=build-release-64-amd64 \
-              --tag "tofuliang/tdlib:${VERSION}-alpine-amd64" \
-              --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-amd64" \
-              --tag "tofuliang/tdlib:latest-amd64" \
-              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-amd64" \
-              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-amd64" \
-              --tag "ghcr.io/tofuliang/tdlib:latest-amd64" \
-              ./alpine; then
-              append_tag "tofuliang/tdlib:${VERSION}-alpine-amd64"
-              append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-amd64"
-              append_tag "tofuliang/tdlib:latest-amd64"
-              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-amd64"
-              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-amd64"
-              append_tag "ghcr.io/tofuliang/tdlib:latest-amd64"
-            else
-              status="failed"
-              failure_reason="release-64-amd64 build failure"
-              write_state "$status" "release-64-amd64" '["release-64-arm64"]' false
-              exit 1
+              if docker buildx build \
+                --platform linux/amd64 \
+                --file ./alpine/Dockerfile \
+                --build-arg TD_COMMIT="$COMMIT_ID" \
+                --push \
+                --cache-from type=gha,scope=build-release-64-amd64 \
+                --cache-to type=gha,mode=max,scope=build-release-64-amd64 \
+                --tag "tofuliang/tdlib:${VERSION}-alpine-amd64" \
+                --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-amd64" \
+                --tag "tofuliang/tdlib:latest-amd64" \
+                --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-amd64" \
+                --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-amd64" \
+                --tag "ghcr.io/tofuliang/tdlib:latest-amd64" \
+                ./alpine; then
+                append_tag "tofuliang/tdlib:${VERSION}-alpine-amd64"
+                append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-amd64"
+                append_tag "tofuliang/tdlib:latest-amd64"
+                append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-amd64"
+                append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-amd64"
+                append_tag "ghcr.io/tofuliang/tdlib:latest-amd64"
+                remaining_stages='["release-64-arm64"]'
+                last_completed_stage="release-64-amd64"
+                status="running"
+                needs_handoff=false
+                write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+              else
+                status="failed"
+                failure_reason="release-64-amd64 build failure"
+                write_state "$status" "release-64-amd64" '["release-64-arm64"]' false
+                exit 1
+              fi
             fi
-            remaining_stages='["release-64-arm64"]'
-            last_completed_stage="release-64-amd64"
-            status="running"
-            needs_handoff=false
-            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
 
-            check_timed_handoff "release-64-amd64" '["release-64-arm64"]'
+            if jq -e --arg stage "release-64-arm64" 'index($stage) != null' <<< "$remaining_stages" > /dev/null; then
+              check_timed_handoff "$last_completed_stage" "$remaining_stages"
 
-            if docker buildx build \
-              --platform linux/arm64 \
-              --file ./alpine/Dockerfile \
-              --build-arg TD_COMMIT="$COMMIT_ID" \
-              --push \
-              --cache-from type=gha,scope=build-release-64-arm64 \
-              --cache-to type=gha,mode=max,scope=build-release-64-arm64 \
-              --tag "tofuliang/tdlib:${VERSION}-alpine-arm64" \
-              --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-arm64" \
-              --tag "tofuliang/tdlib:latest-arm64" \
-              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-arm64" \
-              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-arm64" \
-              --tag "ghcr.io/tofuliang/tdlib:latest-arm64" \
-              ./alpine; then
-              append_tag "tofuliang/tdlib:${VERSION}-alpine-arm64"
-              append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-arm64"
-              append_tag "tofuliang/tdlib:latest-arm64"
-              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-arm64"
-              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-arm64"
-              append_tag "ghcr.io/tofuliang/tdlib:latest-arm64"
-              status="done"
-              last_completed_stage="release-64-done"
-              remaining_stages='[]'
-              needs_handoff=false
-              failure_reason=""
-              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
-            else
-              status="failed"
-              failure_reason="release-64-arm64 build failure"
-              write_state "$status" "release-64-arm64" '[]' false
-              exit 1
+              if docker buildx build \
+                --platform linux/arm64 \
+                --file ./alpine/Dockerfile \
+                --build-arg TD_COMMIT="$COMMIT_ID" \
+                --push \
+                --cache-from type=gha,scope=build-release-64-arm64 \
+                --cache-to type=gha,mode=max,scope=build-release-64-arm64 \
+                --tag "tofuliang/tdlib:${VERSION}-alpine-arm64" \
+                --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-arm64" \
+                --tag "tofuliang/tdlib:latest-arm64" \
+                --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-arm64" \
+                --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-arm64" \
+                --tag "ghcr.io/tofuliang/tdlib:latest-arm64" \
+                ./alpine; then
+                append_tag "tofuliang/tdlib:${VERSION}-alpine-arm64"
+                append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-arm64"
+                append_tag "tofuliang/tdlib:latest-arm64"
+                append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-arm64"
+                append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-arm64"
+                append_tag "ghcr.io/tofuliang/tdlib:latest-arm64"
+                status="done"
+                last_completed_stage="release-64-done"
+                remaining_stages='[]'
+                needs_handoff=false
+                failure_reason=""
+                write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+              else
+                status="failed"
+                failure_reason="release-64-arm64 build failure"
+                write_state "$status" "release-64-arm64" '[]' false
+                exit 1
+              fi
             fi
           fi
       - name: Upload family state
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: unified-ci-state-build-release-64
@@ -302,6 +313,8 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build release 32-bit family
+        timeout-minutes: 330
+        continue-on-error: true
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
@@ -390,6 +403,10 @@ jobs:
             if [ "$status" = "failed" ]; then
               exit 1
             fi
+            if [ "$status" = "handoff" ]; then
+              status="running"
+              needs_handoff=false
+            fi
             last_completed_stage=$(jq -r '.last_completed_stage // "release-32-source"' "$state_file")
             remaining_stages=$(jq -c '.remaining_stages // ["release-32-386", "release-32-armv7"]' "$state_file")
             mapfile -t family_tags < <(jq -r '.artifacts.tags[]?' "$state_file")
@@ -398,74 +415,79 @@ jobs:
           if [ "${status}" = "running" ]; then
             write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
 
-            check_timed_handoff "release-32-source" '["release-32-386", "release-32-armv7"]'
+            if jq -e --arg stage "release-32-386" 'index($stage) != null' <<< "$remaining_stages" > /dev/null; then
+              check_timed_handoff "$last_completed_stage" "$remaining_stages"
 
-            if docker buildx build \
-              --platform linux/386 \
-              --file ./alpine/Dockerfile \
-              --build-arg TD_COMMIT="$COMMIT_ID" \
-              --push \
-              --cache-from type=gha,scope=build-release-32-386 \
-              --cache-to type=gha,mode=max,scope=build-release-32-386 \
-              --tag "tofuliang/tdlib:${VERSION}-alpine-386" \
-              --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-386" \
-              --tag "tofuliang/tdlib:32bit-latest" \
-              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-386" \
-              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-386" \
-              --tag "ghcr.io/tofuliang/tdlib:32bit-latest" \
-              ./alpine; then
-              append_tag "tofuliang/tdlib:${VERSION}-alpine-386"
-              append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-386"
-              append_tag "tofuliang/tdlib:32bit-latest"
-              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-386"
-              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-386"
-              append_tag "ghcr.io/tofuliang/tdlib:32bit-latest"
-            else
-              status="failed"
-              failure_reason="release-32-386 build failure"
-              write_state "$status" "release-32-386" '["release-32-armv7"]' false
-              exit 1
+              if docker buildx build \
+                --platform linux/386 \
+                --file ./alpine/Dockerfile \
+                --build-arg TD_COMMIT="$COMMIT_ID" \
+                --push \
+                --cache-from type=gha,scope=build-release-32-386 \
+                --cache-to type=gha,mode=max,scope=build-release-32-386 \
+                --tag "tofuliang/tdlib:${VERSION}-alpine-386" \
+                --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-386" \
+                --tag "tofuliang/tdlib:32bit-latest" \
+                --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-386" \
+                --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-386" \
+                --tag "ghcr.io/tofuliang/tdlib:32bit-latest" \
+                ./alpine; then
+                append_tag "tofuliang/tdlib:${VERSION}-alpine-386"
+                append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-386"
+                append_tag "tofuliang/tdlib:32bit-latest"
+                append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-386"
+                append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-386"
+                append_tag "ghcr.io/tofuliang/tdlib:32bit-latest"
+                remaining_stages='["release-32-armv7"]'
+                last_completed_stage="release-32-386"
+                status="running"
+                needs_handoff=false
+                write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+              else
+                status="failed"
+                failure_reason="release-32-386 build failure"
+                write_state "$status" "release-32-386" '["release-32-armv7"]' false
+                exit 1
+              fi
             fi
-            remaining_stages='["release-32-armv7"]'
-            last_completed_stage="release-32-386"
-            status="running"
-            needs_handoff=false
-            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
 
-            check_timed_handoff "release-32-386" '["release-32-armv7"]'
+            if jq -e --arg stage "release-32-armv7" 'index($stage) != null' <<< "$remaining_stages" > /dev/null; then
+              check_timed_handoff "$last_completed_stage" "$remaining_stages"
 
-            if docker buildx build \
-              --platform linux/arm/v7 \
-              --file ./alpine/Dockerfile \
-              --build-arg TD_COMMIT="$COMMIT_ID" \
-              --push \
-              --cache-from type=gha,scope=build-release-32-armv7 \
-              --cache-to type=gha,mode=max,scope=build-release-32-armv7 \
-              --tag "tofuliang/tdlib:${VERSION}-alpine-armv7" \
-              --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-armv7" \
-              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-armv7" \
-              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-armv7" \
-              ./alpine; then
-              append_tag "tofuliang/tdlib:${VERSION}-alpine-armv7"
-              append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-armv7"
-              append_tag "tofuliang/tdlib:32bit-latest"
-              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-armv7"
-              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-armv7"
-              append_tag "ghcr.io/tofuliang/tdlib:32bit-latest"
-              status="done"
-              last_completed_stage="release-32-done"
-              remaining_stages='[]'
-              needs_handoff=false
-              failure_reason=""
-              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
-            else
-              status="failed"
-              failure_reason="release-32-armv7 build failure"
-              write_state "$status" "release-32-armv7" '[]' false
-              exit 1
+              if docker buildx build \
+                --platform linux/arm/v7 \
+                --file ./alpine/Dockerfile \
+                --build-arg TD_COMMIT="$COMMIT_ID" \
+                --push \
+                --cache-from type=gha,scope=build-release-32-armv7 \
+                --cache-to type=gha,mode=max,scope=build-release-32-armv7 \
+                --tag "tofuliang/tdlib:${VERSION}-alpine-armv7" \
+                --tag "tofuliang/tdlib:${COMMIT_ID}-alpine-armv7" \
+                --tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-armv7" \
+                --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-armv7" \
+                ./alpine; then
+                append_tag "tofuliang/tdlib:${VERSION}-alpine-armv7"
+                append_tag "tofuliang/tdlib:${COMMIT_ID}-alpine-armv7"
+                append_tag "tofuliang/tdlib:32bit-latest"
+                append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-armv7"
+                append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-alpine-armv7"
+                append_tag "ghcr.io/tofuliang/tdlib:32bit-latest"
+                status="done"
+                last_completed_stage="release-32-done"
+                remaining_stages='[]'
+                needs_handoff=false
+                failure_reason=""
+                write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+              else
+                status="failed"
+                failure_reason="release-32-armv7 build failure"
+                write_state "$status" "release-32-armv7" '[]' false
+                exit 1
+              fi
             fi
           fi
       - name: Upload family state
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: unified-ci-state-build-release-32
@@ -506,6 +528,8 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build debug 64-bit family
+        timeout-minutes: 330
+        continue-on-error: true
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
@@ -594,6 +618,10 @@ jobs:
             if [ "$status" = "failed" ]; then
               exit 1
             fi
+            if [ "$status" = "handoff" ]; then
+              status="running"
+              needs_handoff=false
+            fi
             last_completed_stage=$(jq -r '.last_completed_stage // "debug-64-source"' "$state_file")
             remaining_stages=$(jq -c '.remaining_stages // ["debug-64-amd64", "debug-64-arm64"]' "$state_file")
             mapfile -t family_tags < <(jq -r '.artifacts.tags[]?' "$state_file")
@@ -602,76 +630,81 @@ jobs:
           if [ "${status}" = "running" ]; then
             write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
 
-            check_timed_handoff "debug-64-source" '["debug-64-amd64", "debug-64-arm64"]'
+            if jq -e --arg stage "debug-64-amd64" 'index($stage) != null' <<< "$remaining_stages" > /dev/null; then
+              check_timed_handoff "$last_completed_stage" "$remaining_stages"
 
-            if docker buildx build \
-              --platform linux/amd64 \
-              --file ./alpine/Dockerfile-debug \
-              --build-arg TD_COMMIT="$COMMIT_ID" \
-              --push \
-              --cache-from type=gha,scope=build-debug-64-amd64 \
-              --cache-to type=gha,mode=max,scope=build-debug-64-amd64 \
-              --tag "tofuliang/tdlib:${VERSION}-debug-alpine-amd64" \
-              --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64" \
-              --tag "tofuliang/tdlib:latest-debug-amd64" \
-              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64" \
-              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64" \
-              --tag "ghcr.io/tofuliang/tdlib:latest-debug-amd64" \
-              ./alpine; then
-              append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-amd64"
-              append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64"
-              append_tag "tofuliang/tdlib:latest-debug-amd64"
-              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64"
-              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64"
-              append_tag "ghcr.io/tofuliang/tdlib:latest-debug-amd64"
-            else
-              status="failed"
-              failure_reason="debug-64-amd64 build failure"
-              write_state "$status" "debug-64-amd64" '["debug-64-arm64"]' false
-              exit 1
+              if docker buildx build \
+                --platform linux/amd64 \
+                --file ./alpine/Dockerfile-debug \
+                --build-arg TD_COMMIT="$COMMIT_ID" \
+                --push \
+                --cache-from type=gha,scope=build-debug-64-amd64 \
+                --cache-to type=gha,mode=max,scope=build-debug-64-amd64 \
+                --tag "tofuliang/tdlib:${VERSION}-debug-alpine-amd64" \
+                --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64" \
+                --tag "tofuliang/tdlib:latest-debug-amd64" \
+                --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64" \
+                --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64" \
+                --tag "ghcr.io/tofuliang/tdlib:latest-debug-amd64" \
+                ./alpine; then
+                append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-amd64"
+                append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64"
+                append_tag "tofuliang/tdlib:latest-debug-amd64"
+                append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-amd64"
+                append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-amd64"
+                append_tag "ghcr.io/tofuliang/tdlib:latest-debug-amd64"
+                remaining_stages='["debug-64-arm64"]'
+                last_completed_stage="debug-64-amd64"
+                status="running"
+                needs_handoff=false
+                write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+              else
+                status="failed"
+                failure_reason="debug-64-amd64 build failure"
+                write_state "$status" "debug-64-amd64" '["debug-64-arm64"]' false
+                exit 1
+              fi
             fi
-            remaining_stages='["debug-64-arm64"]'
-            last_completed_stage="debug-64-amd64"
-            status="running"
-            needs_handoff=false
-            write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
 
-            check_timed_handoff "debug-64-amd64" '["debug-64-arm64"]'
+            if jq -e --arg stage "debug-64-arm64" 'index($stage) != null' <<< "$remaining_stages" > /dev/null; then
+              check_timed_handoff "$last_completed_stage" "$remaining_stages"
 
-            if docker buildx build \
-              --platform linux/arm64 \
-              --file ./alpine/Dockerfile-debug \
-              --build-arg TD_COMMIT="$COMMIT_ID" \
-              --push \
-              --cache-from type=gha,scope=build-debug-64-arm64 \
-              --cache-to type=gha,mode=max,scope=build-debug-64-arm64 \
-              --tag "tofuliang/tdlib:${VERSION}-debug-alpine-arm64" \
-              --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64" \
-              --tag "tofuliang/tdlib:latest-debug-arm64" \
-              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64" \
-              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64" \
-              --tag "ghcr.io/tofuliang/tdlib:latest-debug-arm64" \
-              ./alpine; then
-              append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-arm64"
-              append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64"
-              append_tag "tofuliang/tdlib:latest-debug-arm64"
-              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64"
-              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64"
-              append_tag "ghcr.io/tofuliang/tdlib:latest-debug-arm64"
-              status="done"
-              last_completed_stage="debug-64-done"
-              remaining_stages='[]'
-              needs_handoff=false
-              failure_reason=""
-              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
-            else
-              status="failed"
-              failure_reason="debug-64-arm64 build failure"
-              write_state "$status" "debug-64-arm64" '[]' false
-              exit 1
+              if docker buildx build \
+                --platform linux/arm64 \
+                --file ./alpine/Dockerfile-debug \
+                --build-arg TD_COMMIT="$COMMIT_ID" \
+                --push \
+                --cache-from type=gha,scope=build-debug-64-arm64 \
+                --cache-to type=gha,mode=max,scope=build-debug-64-arm64 \
+                --tag "tofuliang/tdlib:${VERSION}-debug-alpine-arm64" \
+                --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64" \
+                --tag "tofuliang/tdlib:latest-debug-arm64" \
+                --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64" \
+                --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64" \
+                --tag "ghcr.io/tofuliang/tdlib:latest-debug-arm64" \
+                ./alpine; then
+                append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-arm64"
+                append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64"
+                append_tag "tofuliang/tdlib:latest-debug-arm64"
+                append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-arm64"
+                append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-arm64"
+                append_tag "ghcr.io/tofuliang/tdlib:latest-debug-arm64"
+                status="done"
+                last_completed_stage="debug-64-done"
+                remaining_stages='[]'
+                needs_handoff=false
+                failure_reason=""
+                write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+              else
+                status="failed"
+                failure_reason="debug-64-arm64 build failure"
+                write_state "$status" "debug-64-arm64" '[]' false
+                exit 1
+              fi
             fi
           fi
       - name: Upload family state
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: unified-ci-state-build-debug-64
@@ -712,6 +745,8 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build debug 32-bit family
+        timeout-minutes: 330
+        continue-on-error: true
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           COMMIT_ID: ${{ needs.prepare.outputs.commit_id }}
@@ -800,6 +835,10 @@ jobs:
             if [ "$status" = "failed" ]; then
               exit 1
             fi
+            if [ "$status" = "handoff" ]; then
+              status="running"
+              needs_handoff=false
+            fi
             last_completed_stage=$(jq -r '.last_completed_stage // "debug-32-source"' "$state_file")
             remaining_stages=$(jq -c '.remaining_stages // ["debug-32-386", "debug-32-armv7"]' "$state_file")
             mapfile -t family_tags < <(jq -r '.artifacts.tags[]?' "$state_file")
@@ -808,68 +847,73 @@ jobs:
           if [ "${status}" = "running" ]; then
             write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
 
-            check_timed_handoff "debug-32-source" '["debug-32-386", "debug-32-armv7"]'
+            if jq -e --arg stage "debug-32-386" 'index($stage) != null' <<< "$remaining_stages" > /dev/null; then
+              check_timed_handoff "$last_completed_stage" "$remaining_stages"
 
-            if docker buildx build \
-              --platform linux/386 \
-              --file ./alpine/Dockerfile-debug \
-              --build-arg TD_COMMIT="$COMMIT_ID" \
-              --push \
-              --cache-from type=gha,scope=build-debug-32-386 \
-              --cache-to type=gha,mode=max,scope=build-debug-32-386 \
-              --tag "tofuliang/tdlib:${VERSION}-debug-alpine-386" \
-              --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386" \
-              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386" \
-              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386" \
-              ./alpine; then
-              append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-386"
-              append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386"
-              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386"
-              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386"
-              status="running"
-              remaining_stages='["debug-32-armv7"]'
-              last_completed_stage="debug-32-386"
-              needs_handoff=false
-              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
-            else
-              status="failed"
-              failure_reason="debug-32-386 build failure"
-              write_state "$status" "debug-32-386" '["debug-32-armv7"]' false
-              exit 1
+              if docker buildx build \
+                --platform linux/386 \
+                --file ./alpine/Dockerfile-debug \
+                --build-arg TD_COMMIT="$COMMIT_ID" \
+                --push \
+                --cache-from type=gha,scope=build-debug-32-386 \
+                --cache-to type=gha,mode=max,scope=build-debug-32-386 \
+                --tag "tofuliang/tdlib:${VERSION}-debug-alpine-386" \
+                --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386" \
+                --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386" \
+                --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386" \
+                ./alpine; then
+                append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-386"
+                append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386"
+                append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-386"
+                append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-386"
+                status="running"
+                remaining_stages='["debug-32-armv7"]'
+                last_completed_stage="debug-32-386"
+                needs_handoff=false
+                write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+              else
+                status="failed"
+                failure_reason="debug-32-386 build failure"
+                write_state "$status" "debug-32-386" '["debug-32-armv7"]' false
+                exit 1
+              fi
             fi
 
-            check_timed_handoff "debug-32-386" '["debug-32-armv7"]'
+            if jq -e --arg stage "debug-32-armv7" 'index($stage) != null' <<< "$remaining_stages" > /dev/null; then
+              check_timed_handoff "$last_completed_stage" "$remaining_stages"
 
-            if docker buildx build \
-              --platform linux/arm/v7 \
-              --file ./alpine/Dockerfile-debug \
-              --build-arg TD_COMMIT="$COMMIT_ID" \
-              --push \
-              --cache-from type=gha,scope=build-debug-32-armv7 \
-              --cache-to type=gha,mode=max,scope=build-debug-32-armv7 \
-              --tag "tofuliang/tdlib:${VERSION}-debug-alpine-armv7" \
-              --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7" \
-              --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7" \
-              --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7" \
-              ./alpine; then
-              append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-armv7"
-              append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7"
-              append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7"
-              append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7"
-              status="done"
-              last_completed_stage="debug-32-done"
-              remaining_stages='[]'
-              needs_handoff=false
-              failure_reason=""
-              write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
-            else
-              status="failed"
-              failure_reason="debug-32-armv7 build failure"
-              write_state "$status" "debug-32-armv7" '[]' false
-              exit 1
+              if docker buildx build \
+                --platform linux/arm/v7 \
+                --file ./alpine/Dockerfile-debug \
+                --build-arg TD_COMMIT="$COMMIT_ID" \
+                --push \
+                --cache-from type=gha,scope=build-debug-32-armv7 \
+                --cache-to type=gha,mode=max,scope=build-debug-32-armv7 \
+                --tag "tofuliang/tdlib:${VERSION}-debug-alpine-armv7" \
+                --tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7" \
+                --tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7" \
+                --tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7" \
+                ./alpine; then
+                append_tag "tofuliang/tdlib:${VERSION}-debug-alpine-armv7"
+                append_tag "tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7"
+                append_tag "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine-armv7"
+                append_tag "ghcr.io/tofuliang/tdlib:${COMMIT_ID}-debug-alpine-armv7"
+                status="done"
+                last_completed_stage="debug-32-done"
+                remaining_stages='[]'
+                needs_handoff=false
+                failure_reason=""
+                write_state "$status" "$last_completed_stage" "$remaining_stages" "$needs_handoff"
+              else
+                status="failed"
+                failure_reason="debug-32-armv7 build failure"
+                write_state "$status" "debug-32-armv7" '[]' false
+                exit 1
+              fi
             fi
           fi
       - name: Upload family state
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: unified-ci-state-build-debug-32

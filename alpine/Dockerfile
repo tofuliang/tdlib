@@ -15,6 +15,7 @@ RUN apk update && \
         git \
         gperf \
         linux-headers \
+        ninja \
         openssl-dev \
         php \
         php-ctype \
@@ -26,7 +27,10 @@ RUN apk update && \
     mkdir ./build && \
     cd ./build && \
     cmake \
+        -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG" \
+        -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_INSTALL_PREFIX:PATH=/usr/local \
         .. && \
