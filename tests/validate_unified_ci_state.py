@@ -25,6 +25,10 @@ def main() -> None:
     require(content, 'actions/download-artifact', '统一 workflow 必须支持恢复上一轮状态 artifact')
     require(content, 'needs: [prepare, build-release-64, build-release-32, build-debug-64, build-debug-32]', 'publish job 必须显式依赖 prepare 和四个 build family')
     require(content, 'run-id: ${{ needs.prepare.outputs.resume_state_ref }}', 'resume_state_ref 必须明确作为上一轮 run-id 使用')
+    if content.count('github-token: ${{ secrets.GITHUB_TOKEN }}') != 4:
+        raise AssertionError('四个 family 跨 Run 下载状态 artifact 时都必须显式传递 GitHub token')
+    if content.count('repository: ${{ github.repository }}') != 4:
+        raise AssertionError('四个 family 跨 Run 下载状态 artifact 时都必须显式指定当前仓库')
     require(content, 'contains(needs.prepare.outputs.resume_targets', '续跑时必须基于 resume_targets 选择要执行的 family job')
     require(content, 'gh workflow run', 'handoff-or-fail 必须真正触发下一轮 workflow，而不是仅打印提示')
     require(content, '--field resume_round=', 'handoff 触发下一轮时必须传递新的 resume_round')
@@ -41,6 +45,15 @@ def main() -> None:
         raise AssertionError('四个 family state artifact 都必须在失败或超时时上传')
     if content.count('check_timed_handoff "$last_completed_stage" "$remaining_stages"') != 8:
         raise AssertionError('每个架构开始前都必须使用恢复后的阶段状态判断 handoff')
+    require(content, 'handoff|running)', 'handoff 协调器必须将超时后仍为 running 的 family 加入续跑目标')
+    if content.count('*release_64.json) incomplete_targets+=("release-64") ;;') != 1:
+        raise AssertionError('release-64 的 running/handoff 状态必须映射到精确续跑目标')
+    if content.count('*release_32.json) incomplete_targets+=("release-32") ;;') != 1:
+        raise AssertionError('release-32 的 running/handoff 状态必须映射到精确续跑目标')
+    if content.count('*debug_64.json) incomplete_targets+=("debug-64") ;;') != 1:
+        raise AssertionError('debug-64 的 running/handoff 状态必须映射到精确续跑目标')
+    if content.count('*debug_32.json) incomplete_targets+=("debug-32") ;;') != 1:
+        raise AssertionError('debug-32 的 running/handoff 状态必须映射到精确续跑目标')
 
     stages = [
         'release-64-amd64',

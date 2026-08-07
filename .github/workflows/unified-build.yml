@@ -76,6 +76,8 @@ jobs:
         with:
           pattern: unified-ci-state-build-release-64
           run-id: ${{ needs.prepare.outputs.resume_state_ref }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
           path: restored-state
           merge-multiple: true
       - name: Prepare release 64-bit build tooling
@@ -293,6 +295,8 @@ jobs:
         with:
           pattern: unified-ci-state-build-release-32
           run-id: ${{ needs.prepare.outputs.resume_state_ref }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
           path: restored-state
           merge-multiple: true
       - name: Prepare release 32-bit build tooling
@@ -508,6 +512,8 @@ jobs:
         with:
           pattern: unified-ci-state-build-debug-64
           run-id: ${{ needs.prepare.outputs.resume_state_ref }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
           path: restored-state
           merge-multiple: true
       - name: Prepare debug 64-bit build tooling
@@ -725,6 +731,8 @@ jobs:
         with:
           pattern: unified-ci-state-build-debug-32
           run-id: ${{ needs.prepare.outputs.resume_state_ref }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
           path: restored-state
           merge-multiple: true
       - name: Prepare debug 32-bit build tooling
@@ -1298,24 +1306,21 @@ jobs:
                 echo "Family failed: $file"
                 exit 1
                 ;;
-              handoff)
-                needs_handoff=true
+              handoff|running)
                 all_done=false
+                needs_handoff=true
+                case "$file" in
+                  *release_64.json) incomplete_targets+=("release-64") ;;
+                  *release_32.json) incomplete_targets+=("release-32") ;;
+                  *debug_64.json) incomplete_targets+=("debug-64") ;;
+                  *debug_32.json) incomplete_targets+=("debug-32") ;;
+                esac
                 ;;
               *)
-                all_done=false
-                needs_handoff=true
+                echo "Invalid family status '$status': $file"
+                exit 1
                 ;;
             esac
-
-            if [ "$status" = "handoff" ]; then
-              case "$file" in
-                *release_64.json) incomplete_targets+=("release-64") ;;
-                *release_32.json) incomplete_targets+=("release-32") ;;
-                *debug_64.json) incomplete_targets+=("debug-64") ;;
-                *debug_32.json) incomplete_targets+=("debug-32") ;;
-              esac
-            fi
           done
 
           if [ "$all_done" = true ]; then
