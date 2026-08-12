@@ -1,4 +1,8 @@
 name: Unified Docker Image Build
+
+concurrency:
+  group: unified-tdlib-build
+  cancel-in-progress: false
 on:
   workflow_dispatch:
     inputs:
@@ -27,13 +31,31 @@ jobs:
   prepare:
     name: Prepare unified build metadata
     runs-on: ubuntu-22.04
+    permissions:
+      packages: read
+      contents: read
     outputs:
       commit_id: ${{ steps.prepare.outputs.commit_id }}
       version: ${{ steps.prepare.outputs.version }}
       resume_round: ${{ steps.prepare.outputs.resume_round }}
       resume_targets: ${{ steps.prepare.outputs.resume_targets }}
       resume_state_ref: ${{ steps.prepare.outputs.resume_state_ref }}
+      build_required: ${{ steps.prepare.outputs.build_required }}
+      already_published: ${{ steps.prepare.outputs.already_published }}
     steps:
+      - name: Log in to Docker Hub for publish check
+        if: ${{ github.event_name == 'schedule' && (github.event.inputs.resume_round == '' || github.event.inputs.resume_round == '0') }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Log in to GHCR for publish check
+        if: ${{ github.event_name == 'schedule' && (github.event.inputs.resume_round == '' || github.event.inputs.resume_round == '0') }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/checkout@master
       - id: prepare
         run: |
@@ -55,15 +77,45 @@ jobs:
             version="$commitId"
           fi
 
+          resume_round="${{ github.event.inputs.resume_round || '0' }}"
+          build_required=true
+          already_published=false
+
+          # Automatic schedules build only versions whose complete release and
+          # debug aggregate manifests are not already present in both registries.
+          # Manual runs remain an explicit force-build mechanism; resume runs
+          # must always continue regardless of manifests created mid-chain.
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$resume_round" = "0" ]; then
+            published_tags=(
+              "tofuliang/tdlib:${version}-alpine"
+              "tofuliang/tdlib:${version}-debug-alpine"
+              "ghcr.io/tofuliang/tdlib:${version}-alpine"
+              "ghcr.io/tofuliang/tdlib:${version}-debug-alpine"
+            )
+            already_published=true
+            for tag in "${published_tags[@]}"; do
+              if ! docker manifest inspect "$tag" > /dev/null 2>&1; then
+                already_published=false
+                break
+              fi
+            done
+            if [ "$already_published" = true ]; then
+              build_required=false
+              echo "Version ${version} is already fully published; skipping scheduled build"
+            fi
+          fi
+
           echo "commit_id=$commitId" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "resume_round=${{ github.event.inputs.resume_round || '0' }}" >> "$GITHUB_OUTPUT"
+          echo "resume_round=$resume_round" >> "$GITHUB_OUTPUT"
           echo "resume_targets=${{ github.event.inputs.resume_targets || 'all' }}" >> "$GITHUB_OUTPUT"
           echo "resume_state_ref=${{ github.event.inputs.resume_state_ref }}" >> "$GITHUB_OUTPUT"
+          echo "build_required=$build_required" >> "$GITHUB_OUTPUT"
+          echo "already_published=$already_published" >> "$GITHUB_OUTPUT"
 
   build-release-64:
     needs: prepare
-    if: ${{ github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-64')) }}
+    if: ${{ needs.prepare.outputs.build_required == 'true' && github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-64')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -282,7 +334,7 @@ jobs:
 
   build-release-32:
     needs: prepare
-    if: ${{ github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-32')) }}
+    if: ${{ needs.prepare.outputs.build_required == 'true' && github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'release-32')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -499,7 +551,7 @@ jobs:
 
   build-debug-64:
     needs: prepare
-    if: ${{ github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-64')) }}
+    if: ${{ needs.prepare.outputs.build_required == 'true' && github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-64')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -718,7 +770,7 @@ jobs:
 
   build-debug-32:
     needs: prepare
-    if: ${{ github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-32')) }}
+    if: ${{ needs.prepare.outputs.build_required == 'true' && github.event.inputs.publish_debug_only != 'true' && (needs.prepare.outputs.resume_round == '0' || contains(needs.prepare.outputs.resume_targets, 'all') || contains(needs.prepare.outputs.resume_targets, 'debug-32')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -929,7 +981,7 @@ jobs:
 
   publish-debug:
     needs: [prepare, build-debug-64, build-debug-32]
-    if: ${{ always() && (github.event.inputs.publish_debug_only == 'true' || (needs.build-debug-64.result == 'success' && needs.build-debug-32.result == 'success')) }}
+    if: ${{ always() && (github.event.inputs.publish_debug_only == 'true' || (needs.prepare.outputs.build_required == 'true' && needs.build-debug-64.result == 'success' && needs.build-debug-32.result == 'success')) }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -1008,9 +1060,13 @@ jobs:
           docker buildx imagetools create -t "ghcr.io/tofuliang/tdlib:${VERSION}-debug-alpine" "${ghcr_sources[@]}"
           docker buildx imagetools create -t "ghcr.io/tofuliang/tdlib:${VERSION}-alpine-debug" "${ghcr_sources[@]}"
           docker buildx imagetools create -t "ghcr.io/tofuliang/tdlib:latest-debug" "${ghcr_sources[@]}"
+      - name: Report deferred debug publish
+        if: steps.debug_gate.outputs.published != 'true'
+        run: echo "Debug aggregate publish deferred until both debug families are complete"
 
   publish:
     needs: [prepare, build-release-64, build-release-32, build-debug-64, build-debug-32]
+    if: ${{ always() && needs.prepare.outputs.build_required == 'true' && github.event.inputs.publish_debug_only != 'true' }}
     runs-on: ubuntu-22.04
     permissions:
       packages: write
@@ -1092,6 +1148,9 @@ jobs:
           docker buildx create --use
           docker buildx inspect --bootstrap
           echo "published=true" >> "$GITHUB_OUTPUT"
+      - name: Report deferred aggregate publish
+        if: steps.publish_gate.outputs.published != 'true'
+        run: echo "Aggregate publish deferred; handoff-or-fail will resume unfinished families"
       - name: Log in to Docker Hub
         if: steps.publish_gate.outputs.published == 'true'
         uses: docker/login-action@v3
@@ -1235,7 +1294,7 @@ jobs:
 
   handoff-or-fail:
     needs: [prepare, build-release-64, build-release-32, build-debug-64, build-debug-32, publish]
-    if: ${{ always() && github.event.inputs.publish_debug_only != 'true' }}
+    if: ${{ always() && needs.prepare.outputs.build_required == 'true' && github.event.inputs.publish_debug_only != 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@master

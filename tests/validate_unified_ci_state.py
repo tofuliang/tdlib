@@ -34,6 +34,48 @@ def main() -> None:
     require(content, '--field resume_round=', 'handoff 触发下一轮时必须传递新的 resume_round')
     require(content, '--field resume_targets=', 'handoff 触发下一轮时必须传递未完成 family 的 resume_targets')
     require(content, '--field resume_state_ref=', 'handoff 触发下一轮时必须传递当前 run-id 作为 resume_state_ref')
+    require(content, 'github.event_name }}" = "schedule"', '版本去重只能自动跳过 schedule，手工构建必须可强制执行')
+    require(content, '"$resume_round" = "0"', '续跑轮次不得被已发布版本检测中断')
+    for tag in [
+        'tofuliang/tdlib:${version}-alpine',
+        'tofuliang/tdlib:${version}-debug-alpine',
+        'ghcr.io/tofuliang/tdlib:${version}-alpine',
+        'ghcr.io/tofuliang/tdlib:${version}-debug-alpine',
+    ]:
+        require(content, tag, f'完整发布检测缺少聚合 tag: {tag}')
+
+    gate_script = r'''
+set -euo pipefail
+event_name="$1"
+resume_round="$2"
+shift 2
+build_required=true
+already_published=false
+if [ "$event_name" = "schedule" ] && [ "$resume_round" = "0" ]; then
+  already_published=true
+  for result in "$@"; do
+    if [ "$result" != "present" ]; then
+      already_published=false
+      break
+    fi
+  done
+  if [ "$already_published" = true ]; then
+    build_required=false
+  fi
+fi
+printf '%s %s\n' "$build_required" "$already_published"
+'''
+    import subprocess
+    scenarios = [
+        (("schedule", "0", "present", "present", "present", "present"), "false true"),
+        (("schedule", "0", "present", "missing", "present", "present"), "true false"),
+        (("workflow_dispatch", "0", "present", "present", "present", "present"), "true false"),
+        (("workflow_dispatch", "1", "present", "present", "present", "present"), "true false"),
+    ]
+    for args, expected in scenarios:
+        result = subprocess.run(["bash", "-c", gate_script, "gate", *args], check=True, capture_output=True, text=True)
+        if result.stdout.strip() != expected:
+            raise AssertionError(f'版本门禁场景 {args} 得到 {result.stdout.strip()!r}，预期 {expected!r}')
 
     if content.count('if [ "$status" = "handoff" ]; then\n              status="running"') != 4:
         raise AssertionError('四个 build family 都必须将恢复的 handoff 状态转回 running')
